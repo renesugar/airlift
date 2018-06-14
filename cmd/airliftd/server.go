@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"image/jpeg"
+	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -20,6 +24,11 @@ import (
 	"time"
 
 	"golang.org/x/image/draw"
+
+	"github.com/alecthomas/chroma"
+	"github.com/alecthomas/chroma/formatters/html"
+	"github.com/alecthomas/chroma/lexers"
+	"github.com/alecthomas/chroma/styles"
 
 	_ "net/http/pprof"
 
@@ -46,6 +55,9 @@ var (
 	// VERSION is the current version of the executable. It is overridden with
 	// build flags in the release process.
 	VERSION = "devel"
+
+	// MODTIME is the "last modified time" used for generated static assets.
+	MODTIME = time.Time{}
 )
 
 const (
@@ -97,10 +109,11 @@ func main() {
 	}
 
 	config.Default = config.Config{
-		Host:      "",
-		Port:      60606,
-		HashLen:   4,
-		Directory: filepath.Join(appDir, "uploads"),
+		Host:        "",
+		Port:        60606,
+		HashLen:     4,
+		Directory:   filepath.Join(appDir, "uploads"),
+		SyntaxTheme: "trac",
 	}
 	if err := config.Init(filepath.Join(appDir, "config")); err != nil {
 		log.Fatal(err)
@@ -192,6 +205,7 @@ func main() {
 		Post("/-/config/size", checkLogin, getSizeLimitPrune).
 		Post("/-/config/age", checkLogin, getAgeLimitPrune).
 		Get("/-/config/overview", checkLogin, getConfigOverview).
+		Get("/-/theme/{name}.css", getThemeCSS).
 		Post("/upload/web", checkLogin, postFile).
 		Post("/upload/file", checkPassword, postFile).
 		Post("/oops", checkPassword, oops).
@@ -213,15 +227,17 @@ func main() {
 
 func getConfig(g *gas.Gas) (int, gas.Outputter) {
 	data := &struct {
-		Conf        *config.Config
-		NumUploads  int
-		UploadsSize fmtutil.Bytes
-		ThumbsSize  fmtutil.Bytes
+		Conf         *config.Config
+		NumUploads   int
+		UploadsSize  fmtutil.Bytes
+		ThumbsSize   fmtutil.Bytes
+		SyntaxThemes []string
 	}{
 		config.Get(),
 		fileCache.Len(),
 		fmtutil.Bytes(fileCache.Size()),
 		fmtutil.Bytes(thumbCache.Size()),
+		styles.Names(),
 	}
 	return 200, out.HTML("config/layout-full", &context{data})
 }
@@ -352,11 +368,34 @@ func getLogout(g *gas.Gas) (int, gas.Outputter) {
 	return 302, out.Redirect("/-/login")
 }
 
+func getThemeCSS(g *gas.Gas) (int, gas.Outputter) {
+	buf := new(bytes.Buffer)
+	err := html.New().WriteCSS(buf, styles.Get(g.Arg("name")))
+	if err != nil {
+		log.Print(err)
+		return 500, out.Error(g, err)
+	}
+
+	r := bytes.NewReader(buf.Bytes())
+	http.ServeContent(g, g.Request, path.Base(g.Request.URL.Path), MODTIME, r)
+
+	return g.Stop()
+}
+
 func getFile(g *gas.Gas) (int, gas.Outputter) {
 	id := g.Arg("id")
 	file := fileCache.Get(id)
 	if file == "" {
 		return 404, out.Error(g, errors.New("ID not found"))
+	}
+
+	form := struct {
+		Raw       bool `form:"raw"`
+		Formatted bool `form:"fmt"`
+	}{}
+
+	if err := g.UnmarshalForm(&form); err != nil {
+		return 400, out.Error(g, err)
 	}
 
 	conf := config.Get()
@@ -400,9 +439,100 @@ func getFile(g *gas.Gas) (int, gas.Outputter) {
 	// enable browser caching for resources behind TLS
 	g.Header().Set("Cache-Control", "public")
 
-	http.ServeFile(g, g.Request, file)
+	f, err := os.Open(file)
+	if err != nil {
+		return 500, out.Error(g, err)
+	}
 
-	return -1, nil
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	_, err = io.ReadFull(f, buf)
+	if err != nil {
+		return 500, out.Error(g, err)
+	}
+
+	contentType := http.DetectContentType(buf)
+
+	if !strings.HasPrefix(contentType, "text/") {
+		http.ServeFile(g, g.Request, file)
+		return g.Stop()
+	}
+
+	clientWantsRaw := form.Raw
+	uas := g.UserAgents()
+
+	// for no user-agent or command line client, default to raw
+	if len(uas) == 0 {
+		clientWantsRaw = !form.Formatted
+	}
+
+	for _, ua := range uas {
+		switch strings.ToLower(ua.Name) {
+		case "curl", "wget":
+			clientWantsRaw = !form.Formatted
+		}
+	}
+
+	// browser user-agents should get formatted. regardless, one can force
+	// either way with url param if it matters
+	if form.Raw || clientWantsRaw || !conf.SyntaxEnable {
+		http.ServeFile(g, g.Request, file)
+		return g.Stop()
+	}
+
+	// Find lexer for file
+	lexer := lexers.Analyse(string(buf))
+	if lexer == nil {
+		extension := strings.TrimLeft(filepath.Ext(file), ".")
+		lexer = lexers.Get(extension)
+	}
+
+	if lexer == nil {
+		http.ServeFile(g, g.Request, file)
+		return g.Stop()
+	}
+
+	lexer = chroma.Coalesce(lexer)
+
+	s := styles.Get(conf.SyntaxTheme)
+	if s == nil {
+		s = styles.Fallback
+	}
+
+	// Serve non-text files that slipped through, read text files to string
+	f.Seek(0, os.SEEK_SET)
+	buffer, err := ioutil.ReadAll(f)
+	if err != nil {
+		return 500, out.Error(g, err)
+	}
+	contents := string(buffer)
+
+	// Setup formatter & iterate over file
+	formatter := html.New(html.WithClasses())
+	iterator, err := lexer.Tokenise(nil, contents)
+
+	// Get HTML
+	htmlBuffer := new(bytes.Buffer)
+	err = formatter.Format(htmlBuffer, s, iterator)
+
+	if err != nil {
+		log.Print(err)
+		http.ServeFile(g, g.Request, file)
+		return g.Stop()
+	}
+
+	// Render template
+	data := &struct {
+		SyntaxTheme string
+		HTML        template.HTML
+		Filename    string
+	}{
+		s.Name,
+		template.HTML(htmlBuffer.String()),
+		strings.SplitN(filepath.Base(file), ".", 2)[1],
+	}
+	return 200, out.HTML("syntax/layout-syntax", &context{data})
 }
 
 func postFile(g *gas.Gas) (int, gas.Outputter) {
